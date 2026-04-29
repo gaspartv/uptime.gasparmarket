@@ -1,0 +1,186 @@
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/gaspartv/uptime.gasparmarket/src/config"
+)
+
+type CheckResult struct {
+	URL        string        `json:"url"`
+	Online     bool          `json:"online"`
+	StatusCode int           `json:"statusCode,omitempty"`
+	Error      string        `json:"error,omitempty"`
+	Latency    time.Duration `json:"latency"`
+	CheckedAt  time.Time     `json:"checkedAt"`
+}
+
+type UptimeService struct {
+	httpClient *http.Client
+	env        *config.Env
+}
+
+func NewUptimeService(timeout time.Duration, env *config.Env) *UptimeService {
+	return &UptimeService{
+		httpClient: &http.Client{Timeout: timeout},
+		env:        env,
+	}
+}
+
+func (s *UptimeService) Start(ctx context.Context, urls []string, interval time.Duration) {
+	if len(urls) == 0 {
+		return
+	}
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.runCheck(ctx, urls)
+			}
+		}
+	}()
+}
+
+func (s *UptimeService) CheckNow(ctx context.Context, urls []string) []CheckResult {
+	results := make([]CheckResult, 0, len(urls))
+	for _, targetURL := range urls {
+		results = append(results, s.checkTarget(ctx, targetURL))
+	}
+
+	return results
+}
+
+func (s *UptimeService) runCheck(ctx context.Context, urls []string) {
+	results := s.CheckNow(ctx, urls)
+	for _, result := range results {
+		if result.Online {
+			continue
+		}
+
+		log.Printf("[uptime] %s is offline: %s", result.URL, result.Error)
+
+		if err := s.notifyWhatsApp(ctx, result); err != nil {
+			log.Printf("[uptime] failed to notify WhatsApp for %s: %v", result.URL, err)
+		}
+	}
+}
+
+func (s *UptimeService) checkTarget(ctx context.Context, targetURL string) CheckResult {
+	startedAt := time.Now()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return CheckResult{
+			URL:       targetURL,
+			Online:    false,
+			Error:     err.Error(),
+			Latency:   time.Since(startedAt),
+			CheckedAt: startedAt,
+		}
+	}
+
+	response, err := s.httpClient.Do(request)
+	if err != nil {
+		return CheckResult{
+			URL:       targetURL,
+			Online:    false,
+			Error:     err.Error(),
+			Latency:   time.Since(startedAt),
+			CheckedAt: startedAt,
+		}
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, response.Body)
+
+	online := response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices
+	result := CheckResult{
+		URL:        targetURL,
+		Online:     online,
+		StatusCode: response.StatusCode,
+		Latency:    time.Since(startedAt),
+		CheckedAt:  startedAt,
+	}
+
+	if !online {
+		result.Error = http.StatusText(response.StatusCode)
+		if result.Error == "" {
+			result.Error = "target returned a non-success status code"
+		}
+	}
+
+	return result
+}
+
+func (s *UptimeService) notifyWhatsApp(ctx context.Context, result CheckResult) error {
+	message := buildOfflineMessage(result)
+	whatsappURL := strings.TrimRight(s.env.APIWhatsAppFakeURL, "/") + "/message/sendText/" + url.PathEscape(s.env.APIWhatsAppFakeInstance)
+	var sendErrors []error
+
+	for _, number := range s.env.WhatsAppSenderNumbers {
+		if err := s.sendWhatsApp(ctx, whatsappURL, number, message); err != nil {
+			sendErrors = append(sendErrors, fmt.Errorf("send whatsapp to %s: %w", number, err))
+		}
+	}
+
+	if len(sendErrors) > 0 {
+		return errors.Join(sendErrors...)
+	}
+
+	return nil
+}
+
+func (s *UptimeService) sendWhatsApp(ctx context.Context, whatsappURL string, number string, message string) error {
+	payload := map[string]any{
+		"number": number,
+		"options": map[string]any{
+			"delay": 1200,
+		},
+		"textMessage": map[string]any{
+			"text": message,
+		},
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, whatsappURL, strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+s.env.APIWhatsAppFakeToken)
+
+	response, err := s.httpClient.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, response.Body)
+
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("whatsapp api returned status %s for number %s", response.Status, number)
+	}
+
+	return nil
+}
+
+func buildOfflineMessage(result CheckResult) string {
+	return fmt.Sprintf("Alerta de uptime: %s está offline. Status: %d. Erro: %s", result.URL, result.StatusCode, result.Error)
+}
