@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"strings"
@@ -52,6 +53,8 @@ func (s *UptimeService) Start(ctx context.Context, urls []string, onlineInterval
 	for _, targetURL := range urls {
 		go s.monitorTarget(ctx, targetURL, onlineInterval, offlineInterval)
 	}
+
+	go s.startHeartbeat(ctx)
 }
 
 func (s *UptimeService) monitorTarget(ctx context.Context, targetURL string, onlineInterval time.Duration, offlineInterval time.Duration) {
@@ -213,4 +216,45 @@ func (s *UptimeService) sendWhatsApp(ctx context.Context, whatsappURL string, nu
 
 func buildOfflineMessage(result CheckResult) string {
 	return fmt.Sprintf("Alerta de uptime: %s está offline. Status: %d. Erro: %s", result.URL, result.StatusCode, result.Error)
+}
+
+var heartbeatMessages = []string{
+	"Serviço de mensagem e de uptime funcionando corretamente %d",
+	"Sistema de notificação está operacional %d",
+	"Uptime monitor e WhatsApp em perfeito funcionamento %d",
+	"Verificação de saúde dos serviços: tudo ok %d",
+	"Sistema respondendo normalmente %d",
+	"Monitor de disponibilidade ativo e funcionando %d",
+	"Serviços de notificação e uptime estão online %d",
+	"Heartbeat: tudo operacional neste momento %d",
+}
+
+func (s *UptimeService) startHeartbeat(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.sendHeartbeat(ctx)
+		}
+	}
+}
+
+func (s *UptimeService) sendHeartbeat(ctx context.Context) {
+	randNum := rand.Intn(1000000)
+	messageTemplate := heartbeatMessages[rand.Intn(len(heartbeatMessages))]
+	message := fmt.Sprintf(messageTemplate, randNum)
+
+	whatsappURL := strings.TrimRight(s.env.APIWhatsAppFakeURL, "/") + "/message/sendText/" + url.PathEscape(s.env.APIWhatsAppFakeInstance)
+
+	for _, number := range s.env.WhatsAppSenderNumbers {
+		if err := s.sendWhatsApp(ctx, whatsappURL, number, message); err != nil {
+			log.Printf("[uptime] failed to send heartbeat to %s: %v", number, err)
+		} else {
+			log.Printf("[uptime] heartbeat sent to %s: %s", number, message)
+		}
+	}
 }
