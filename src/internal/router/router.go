@@ -14,7 +14,7 @@ func InitializeRoutes(env *config.Env) {
 	router := gin.Default()
 
 	uptimeService := service.NewUptimeService(10*time.Second, env)
-	uptimeService.Start(context.Background(), env.APIChecksURL, time.Minute)
+	uptimeService.Start(context.Background(), env.APIChecksURL, time.Minute, 5*time.Minute)
 
 	uptimeHandler := handler.NewUptimeHandler(uptimeService, env.APIChecksURL)
 	uptimeRoutes := router.Group("uptime")

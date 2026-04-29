@@ -36,24 +36,50 @@ func NewUptimeService(timeout time.Duration, env *config.Env) *UptimeService {
 	}
 }
 
-func (s *UptimeService) Start(ctx context.Context, urls []string, interval time.Duration) {
+func (s *UptimeService) Start(ctx context.Context, urls []string, onlineInterval time.Duration, offlineInterval time.Duration) {
 	if len(urls) == 0 {
 		return
 	}
 
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
+	if onlineInterval <= 0 {
+		onlineInterval = time.Minute
+	}
 
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				s.runCheck(ctx, urls)
+	if offlineInterval <= 0 {
+		offlineInterval = 5 * time.Minute
+	}
+
+	for _, targetURL := range urls {
+		go s.monitorTarget(ctx, targetURL, onlineInterval, offlineInterval)
+	}
+}
+
+func (s *UptimeService) monitorTarget(ctx context.Context, targetURL string, onlineInterval time.Duration, offlineInterval time.Duration) {
+	nextInterval := onlineInterval
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			result := s.checkTarget(ctx, targetURL)
+			if result.Online {
+				nextInterval = onlineInterval
+			} else {
+				log.Printf("[uptime] %s is offline: %s", result.URL, result.Error)
+
+				if err := s.notifyWhatsApp(ctx, result); err != nil {
+					log.Printf("[uptime] failed to notify WhatsApp for %s: %v", result.URL, err)
+				}
+
+				nextInterval = offlineInterval
 			}
+
+			timer.Reset(nextInterval)
 		}
-	}()
+	}
 }
 
 func (s *UptimeService) CheckNow(ctx context.Context, urls []string) []CheckResult {
@@ -172,9 +198,13 @@ func (s *UptimeService) sendWhatsApp(ctx context.Context, whatsappURL string, nu
 		return err
 	}
 	defer response.Body.Close()
-	_, _ = io.Copy(io.Discard, response.Body)
+	responseBody, _ := io.ReadAll(response.Body)
 
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		if len(responseBody) > 0 {
+			return fmt.Errorf("whatsapp api returned status %s for number %s: %s", response.Status, number, strings.TrimSpace(string(responseBody)))
+		}
+
 		return fmt.Errorf("whatsapp api returned status %s for number %s", response.Status, number)
 	}
 
